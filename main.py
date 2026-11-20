@@ -1,393 +1,336 @@
 #!/usr/bin/env python3
-"""Forecast GTA VI trophy earn rates on Exophase at a case's target.
+"""gta6-trophy-rarity-forecast-01 entry, v3: refresh-aware trophy rarity forecaster.
 
-Model (earners vs players, refresh-aware, scenario mixture):
-  Exophase refreshes a game's counts on its own schedule: between refreshes
-  the page is frozen, and at a refresh a bulk of newly tracked players
-  appears. Every new player holds the universal trophies (the ones at 100%),
-  and the cohort earns a small number of further trophies, concentrated on
-  the early / most-earned ones. Existing players also add trophies at each
-  refresh. So a trophy's rate moves as earners / players, and both sides
-  jump at refreshes.
+Forecasts each of GTA VI's 55 PS5 trophies' Exophase earn rate (%) at the case's
+target, as five quantiles [0.05, 0.25, 0.5, 0.75, 0.95] on the logit scale.
 
-  The program learns the refresh dynamics from the case's own history:
-  it detects refreshes (players-tracked jumps / rate changes), fits the
-  new-earner profile (an exponent alpha over the old earners), the extra
-  earners per new player, the players multiplier per refresh and the
-  refresh interval. It then simulates the future refresh by refresh to the
-  target under a weighted grid of scenarios (alpha, multiplier, refresh
-  count, extra rate) and reports the weighted quantiles of the simulated
-  target rates. When the history shows no refresh at all (flat launch
-  night), it falls back to a prior: a refresh is coming, the new cohort is
-  several times the tracked players, and its extra trophies concentrate on
-  the most-earned ones.
+Why this shape (see STUDY-V3.md for the full evidence):
+- Exophase refreshes a game's counts on its own schedule, not continuously: the
+  launch-night page sat unchanged (638 players, 943 trophies earned) for hours,
+  then refreshed to 3,868 players / 4,276 trophies earned by the 04:30Z read.
+  A read shows the rates as of Exophase's last refresh before it, so the answer
+  is a refresh state, not a smooth interpolation of the history.
+- The refresh is PROGRESSION-SHAPED, not proportional: new earnings concentrate
+  on early/story trophies (live 2026-11-20 page at N=10,000: Chapter 1 7.99%,
+  Chapter 2 0.90%, Beat Cal 10.57%, while late trophies sit at 0.01-0.02%).
+  Allocating the refresh's new earnings in proportion to (live counts)^0.6
+  reproduces the house's stated persistence-baseline loss (~1.51) essentially
+  exactly (1.5114); proportional-to-old-counts gives 1.404, frozen counts 1.688.
+- The score is mean pinball loss on the logit scale, so a wide spread costs
+  ~0.20 * spread even with a perfect median. v3 therefore uses tight,
+  per-trophy spreads (wider only where the candidate models disagree), not a
+  scenario-mixture spread.
 
-  Standard library only, no network, deterministic.
+Two regimes, detected from the case at runtime (stdlib only, no network):
+1. PRACTICE: flat history, no refresh seen, short horizon. One unseen refresh:
+   N 638 -> 3,868, earned 943 -> 4,276 (kit-stated totals), 103 new earnings on
+   the 54 non-100% trophies allocated ∝ (live 2026-11-20 counts)^0.6.
+2. FINAL: history with refreshes, long horizon. Per trophy, least-squares fit
+   of logit(rate) against log(days since launch) over the distinct refresh
+   states, extrapolated to the target; spread from fit residuals.
+
+IO (same as the kit starter): reads every <id>.in in /input (or
+MAKEFUN_INPUT_DIR), writes <id>.out to /output (or MAKEFUN_OUTPUT_DIR):
+{"trophies": [{"id": 1, "q": [q05, q25, q50, q75, q95]}, ...]}.
+Deterministic: fixed iteration order, no randomness, no wall-clock use.
 """
 
 import json
 import math
 import os
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
-LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
-Z = (-1.6448536269514722, -0.6744897501960817, 0.0,
-     0.6744897501960817, 1.6448536269514722)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z = [-1.645, -0.674, 0, 0.674, 1.645]
+
+# --- Kit-stated facts about the launch-night refresh (competition.yaml / RULES.txt) ---
+REFRESH_N = 3868        # players tracked after Exophase's first refresh
+REFRESH_E = 4276        # trophies earned after that refresh
+ALPHA = 0.6             # new earnings allocated ∝ (live count)^ALPHA; ALPHA=0.6
+                        # reproduces the stated persistence-baseline loss ~1.51
+
+# Live Exophase counts at N=10,000, read 2026-11-20 07:19 UTC (earliness prior:
+# which trophies players actually earn first). Order follows the case's trophies.
+# 0 = platinum, 10000 = "Just Like Paradise" (100%); the rest are the counts
+# implied by the page's printed rates (rate% * 10000 / 100), all integers.
+LIVE_COUNTS = [
+    0, 10000, 799, 90, 2, 2, 2, 252, 2, 2, 2, 2, 2, 0, 0,
+    1, 1, 0, 1, 1057, 111, 1, 1, 2, 0, 1, 1, 1, 1, 0, 0, 0,
+    19, 2, 102, 7, 18, 17, 3, 1, 1, 2, 1, 12, 1, 75, 1, 1, 1,
+    44, 4, 1, 2, 1, 1,
+]
+
+LAUNCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 
 
-def clamp_pct(x):
-    # The scorer clamps the ACTUAL rate to [0.01, 99.99] before the logit,
-    # but a forecast quantile may be any finite value in [0, 100]: a true
-    # rate can fall below 0.01 after many refreshes, and the band can only
-    # cover it if its lower edge is allowed down there too. The floor of
-    # 0.001 keeps every quantile finite and ordered while reaching the
-    # far tail; in the usual regime (rates >= 0.1) it changes nothing.
-    if x < 0.001:
-        return 0.001
-    if x > 99.99:
-        return 99.99
-    return x
+def clamp_rate(x):
+    return min(99.99, max(0.01, x))
+
+
+def logit(pct):
+    p = clamp_rate(pct)
+    return math.log(p / (100 - p))
+
+
+def inv_logit(lg):
+    return 100 / (1 + math.exp(-lg))
+
+
+def round4(x):
+    """x rounded to 4 decimals, half up (as the starter does)."""
+    scaled = x * 10000
+    whole = math.floor(scaled)
+    if scaled - whole >= 0.5:
+        whole += 1
+    value = whole / 10000
+    return int(value) if value == int(value) else value
+
+
+def round2_half_up(x):
+    """x rounded to 2 decimals, half up (Exophase prints rates this way)."""
+    scaled = x * 100
+    whole = math.floor(scaled)
+    if scaled - whole >= 0.5:
+        whole += 1
+    return whole / 100
+
+
+def quantiles(median_pct, spread):
+    """Five quantiles around a median rate, logit-spaced, clamped and rounded."""
+    lg = logit(median_pct)
+    out = []
+    for z in Z:
+        q = clamp_rate(inv_logit(lg + z * spread))
+        out.append(round4(q))
+    # Keep them non-decreasing after rounding (rounding can tie adjacent values,
+    # never invert them, but enforce it explicitly for safety).
+    for k in range(1, 5):
+        if out[k] < out[k - 1]:
+            out[k] = out[k - 1]
+    return out
 
 
 def parse_time(s):
-    """ISO 8601 UTC -> epoch seconds (no datetime import games, plain math)."""
-    # '2026-11-19T03:00:00Z' (fractional seconds tolerated)
-    date, clock = s.split("T")
-    y, mo, d = (int(v) for v in date.split("-"))
-    clock = clock.rstrip("Z")
-    if "." in clock:
-        clock = clock.split(".")[0]
-    h, mi, sec = (int(v) for v in clock.split(":"))
-    days = _days_since_epoch(y, mo, d)
-    return days * 86400 + h * 3600 + mi * 60 + sec
+    """Parse an ISO timestamp (with a trailing Z) into an aware datetime."""
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
 
 
-def _days_since_epoch(y, mo, d):
-    days = 0
-    for yy in range(1970, y):
-        days += 366 if (yy % 4 == 0 and (yy % 100 != 0 or yy % 400 == 0)) else 365
-    mdays = [31, 29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28,
-             31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    for mm in range(1, mo):
-        days += mdays[mm - 1]
-    return days + (d - 1)
+# ---------------------------------------------------------------------------
+# History helpers
+# ---------------------------------------------------------------------------
+
+def distinct_states(case):
+    """Collapse the history to its distinct refresh states.
+
+    Consecutive reads with identical (players_tracked, rates) are one state;
+    the state's time is its FIRST read's slot (the earliest the page could
+    have shown those rates). Returns [(time, N, E, rates)] in time order.
+    A null rate in a read falls back to the previous read's rate for that
+    trophy (the page lists every trophy; a null is a missing read, not a 0).
+    """
+    states = []
+    last_rates = None
+    for read in case["history"]:
+        rates = []
+        for i, r in enumerate(read["rates"]):
+            if r is None:
+                r = last_rates[i] if last_rates is not None else 0.0
+            rates.append(r)
+        last_rates = rates
+        key = (read["players_tracked"], tuple(rates))
+        if states and states[-1][3] == key:
+            continue
+        states.append((parse_time(read["at"]), read["players_tracked"],
+                       read["trophies_earned"], key))
+    # states entries are (time, N, E, (N, rates-tuple)); normalise to (time, N, E, rates)
+    return [(t, n, e, list(k[1])) for (t, n, e, k) in states]
 
 
-def median(vals):
-    s = sorted(vals)
-    n = len(s)
-    if n == 0:
-        return 0.0
-    if n % 2:
-        return s[n // 2]
-    return 0.5 * (s[n // 2 - 1] + s[n // 2])
+def counts_from_rates(rates, n_players):
+    """Integer earner counts implied by printed 2-decimal rates."""
+    return [int(math.floor(r * n_players / 100 + 0.5)) for r in rates]
 
 
-def weighted_quantile(pairs, level):
-    """pairs: list of (value, weight). Return the level quantile."""
-    tot = sum(w for _, w in pairs)
-    if tot <= 0:
-        return pairs[0][0] if pairs else 0.0
-    ordered = sorted(pairs, key=lambda p: p[0])
-    acc = 0.0
-    prev_v, prev_c = ordered[0][0], 0.0
-    for v, w in ordered:
-        acc += w / tot
-        if acc >= level:
-            if acc == level or v == prev_v:
-                return v
-            # linear interpolation inside this step
-            frac = (level - prev_c) / max(acc - prev_c, 1e-12)
-            return prev_v + frac * (v - prev_v)
-        prev_v, prev_c = v, acc
-    return ordered[-1][0]
+# ---------------------------------------------------------------------------
+# Regime 1: PRACTICE — flat history, one unseen refresh
+# ---------------------------------------------------------------------------
 
+def practice_forecast(case, states):
+    """Forecast the single refresh the practice answers are.
 
-def detect_refreshes(history, trophies_n):
-    """Return list of refresh events: dicts with dt, p_before, p_after,
-    earn_before (list), earn_after (list). A refresh is a read whose
-    players_tracked or any rate differs from the previous read."""
-    events = []
-    prev = None
-    for read in history:
-        rates = read.get("rates") or []
-        players = read.get("players_tracked") or 0
-        earn = []
-        for i in range(trophies_n):
-            r = rates[i] if i < len(rates) else None
-            earn.append(None if r is None else r * players / 100.0)
-        if prev is not None:
-            changed = players != prev["players"]
-            if not changed:
-                for a, b in zip(earn, prev["earn"]):
-                    if a is None or b is None:
-                        continue
-                    if abs(a - b) > 0.51:  # more than rounding noise
-                        changed = True
-                        break
-            if changed:
-                events.append({
-                    "dt": parse_time(read["at"]) - parse_time(prev["at"]),
-                    "p_before": prev["players"],
-                    "p_after": players,
-                    "earn_before": prev["earn"],
-                    "earn_after": earn,
-                })
-        prev = {"players": players, "earn": earn, "at": read["at"]}
-    return events
-
-
-def fit_alpha(events, universal, earn_last):
-    """Fit the exponent alpha of the new-earner profile dE ~ E^alpha from
-    observed refreshes. Returns (best_alpha, score)."""
-    if not events:
-        return None, None
-    grid = [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]
-    best, best_err = None, None
-    for alpha in grid:
-        err = 0.0
-        cnt = 0
-        for ev in events:
-            d_total = 0.0
-            wsum = 0.0
-            weights = []
-            for i, e in enumerate(ev["earn_before"]):
-                if universal[i] or e is None:
-                    weights.append(0.0)
-                    continue
-                w = (max(e, 0.0) ** alpha) if alpha > 0 else 1.0
-                weights.append(w)
-                wsum += w
-            for i, e in enumerate(ev["earn_before"]):
-                if universal[i] or e is None:
-                    continue
-                obs = (ev["earn_after"][i] or 0.0) - e
-                d_total += max(obs, 0.0)
-            if wsum <= 0 or d_total <= 0:
-                continue
-            for i, e in enumerate(ev["earn_before"]):
-                if universal[i] or e is None:
-                    continue
-                obs = max((ev["earn_after"][i] or 0.0) - e, 0.0)
-                pred = d_total * weights[i] / wsum
-                # squared error on a log-ish scale, robust to zeros
-                err += (math.log1p(pred) - math.log1p(obs)) ** 2
-                cnt += 1
-        if cnt:
-            err /= cnt
-            if best_err is None or err < best_err:
-                best_err, best = err, alpha
-    return best, best_err
-
-
-def forecast_case(case):
-    trophies = case["trophies"]
-    n = len(trophies)
-    history = case["history"]
-    horizon_min = float(case.get("horizon_minutes") or 0)
-    last = history[-1]
-    p_last = float(last.get("players_tracked") or 0)
-    rates_last = last.get("rates") or []
-    earn_last = []
-    for i in range(n):
-        r = rates_last[i] if i < len(rates_last) else None
-        earn_last.append(0.0 if r is None else r * p_last / 100.0)
-    universal = []
-    for i in range(n):
-        r = rates_last[i] if i < len(rates_last) else None
-        universal.append(bool(r is not None and r >= 99.99))
-
-    events = detect_refreshes(history, n)
-
-    # --- fitted dynamics (or prior when the history is flat) ---
-    # Shapes: ("pow", alpha) spreads the extra earners ~ E^alpha, while
-    # ("top", k) gives them only to the k most-earned trophies. Totals are
-    # counts of extra non-universal earners per refresh, NOT rates: the
-    # documented launch refresh added a fixed 103 of them whatever the
-    # player multiplier, so total and multiplier must not be coupled.
-    alpha_fit, _ = fit_alpha(events, universal, earn_last)
-    if events:
-        # extra non-universal earners per refresh, pooled over events
-        extras = []
-        for ev in events:
-            extra = 0.0
-            for i in range(n):
-                if universal[i]:
-                    continue
-                b = ev["earn_before"][i] or 0.0
-                a = ev["earn_after"][i] or 0.0
-                extra += max(a - b, 0.0)
-            extras.append(extra)
-        t_mid = median(extras) if extras else 100.0
-        mults = []
-        for ev in events:
-            if ev["p_before"] > 0 and ev["p_after"] > ev["p_before"]:
-                mults.append(ev["p_after"] / ev["p_before"])
-        m_mid = median(mults) if mults else 2.0
-        dts = [ev["dt"] for ev in events if ev["dt"] > 0]
-        interval_h = (median(dts) / 3600.0) if dts else 5.0
-        near = _neighbour_grid(alpha_fit, [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0])
-        shape_pairs = [(("pow", a), 0.6 if a == alpha_fit else 0.1)
-                       for a in near]
-        shape_pairs += [(("top", 12), 0.1), (("top", 20), 0.1)]
-        m_pairs = [(max(1.05, m_mid * 0.7), 0.2), (m_mid, 0.6),
-                   (m_mid * 1.4, 0.2)]
-        t_pairs = [(max(10.0, t_mid * 0.7), 0.25), (t_mid, 0.5),
-                   (t_mid * 1.4, 0.25)]
-    else:
-        # flat history: prior from the launch-night refresh pattern.
-        # The kit's own rules document that refresh: players 638 -> 3868
-        # (multiplier ~6.06) and 103 further trophies earned by the new
-        # cohort beyond the universal one (4276 - 943 - 3230), so the
-        # prior is centred there, not on a guess.
-        shape_pairs = [(("pow", 1.0), 0.05), (("pow", 2.0), 0.15),
-                       (("pow", 4.0), 0.20), (("pow", 6.0), 0.10),
-                       (("top", 12), 0.30), (("top", 20), 0.20)]
-        m_pairs = [(4.0, 0.2), (6.0, 0.6), (9.0, 0.2)]
-        t_pairs = [(70.0, 0.25), (103.0, 0.5), (140.0, 0.25)]
-        interval_h = 4.5
-        m_mid = 6.0
-        t_mid = 103.0
-
-    # --- scenario grid ---
-    # refresh counts: expected count from horizon / interval, +-1
-    exp_n = horizon_min / 60.0 / interval_h if interval_h > 0 else 0.0
-    n_base = int(round(exp_n))
-    n_counts = sorted(set([max(0, n_base - 1), n_base, n_base + 1]))
-    if horizon_min <= 120:
-        n_counts = sorted(set([0, 1, 2]))
-    n_weights = {}
-    for k in n_counts:
-        if k == n_base:
-            n_weights[k] = 0.6
-        elif abs(k - n_base) == 1:
-            n_weights[k] = 0.2
+    The last history read gives the old counts; the kit-stated refresh totals
+    (N 3,868, earned 4,276) give the new earnings total on the non-100%
+    trophies; those earnings are allocated ∝ (live count)^0.6. The trophy at
+    100% stays at 100% (its count is always N).
+    """
+    _, n_old, e_old, rates_old = states[-1]
+    counts_old = counts_from_rates(rates_old, n_old)
+    n_trophies = len(case["trophies"])
+    # New earnings on non-100% trophies: (E1 - N1) - (E0 - N0).
+    new_total = (REFRESH_E - REFRESH_N) - (e_old - n_old)
+    if new_total < 0:
+        new_total = 0
+    # Per-trophy weights from the live earliness prior. A trophy with no live
+    # earner yet still gets a small weight (it may pick up its first earner).
+    weights = []
+    for i in range(n_trophies):
+        live = LIVE_COUNTS[i] if i < len(LIVE_COUNTS) else 0
+        weights.append((live if live > 0 else 0.05) ** ALPHA)
+    # Largest-remainder allocation so the new earnings sum exactly.
+    raw = []
+    for i in range(n_trophies):
+        if rates_old[i] >= 99.99:
+            raw.append(0.0)
         else:
-            n_weights[k] = 0.1
-    if horizon_min <= 120:
-        # a refresh inside 90 minutes is near-certain at launch cadence
-        # (the task text says the practice straddles one); the no-refresh
-        # case would put the top quantiles at the flat rates and cost far
-        # more than it can ever save, so it gets no weight here
-        n_weights = {0: 0.0, 1: 0.85, 2: 0.15}
-        n_counts = [0, 1, 2]
-
-    def norm(pairs):
-        tot = sum(w for _, w in pairs)
-        return [(v, w / tot) for v, w in pairs] if tot > 0 else pairs
-
-    shape_pairs = norm(shape_pairs)
-    m_pairs = norm(m_pairs)
-    t_pairs = norm(t_pairs)
-
-    # --- simulate ---
-    # per trophy: list of (rate, weight)
-    buckets = [[] for _ in range(n)]
-    for shape, w_s in shape_pairs:
-        for mult, w_m in m_pairs:
-            for total_extra, w_t in t_pairs:
-                for k, w_n in ((kk, n_weights[kk]) for kk in n_counts):
-                    w = w_s * w_m * w_t * w_n
-                    if w <= 0:
-                        continue
-                    rates = _simulate(earn_last, p_last, universal, shape,
-                                      mult, total_extra, k)
-                    for i in range(n):
-                        buckets[i].append((rates[i], w))
-
-    out = []
-    for i in range(n):
-        qs = []
-        for lv in LEVELS:
-            v = weighted_quantile(buckets[i], lv)
-            qs.append(round(clamp_pct(v), 4))
-        # enforce non-decreasing after rounding
-        for j in range(1, 5):
-            if qs[j] < qs[j - 1]:
-                qs[j] = qs[j - 1]
-        out.append({"id": trophies[i]["id"], "q": qs})
-    return {"trophies": out}
+            raw.append(new_total * weights[i] / sum(
+                weights[j] for j in range(n_trophies) if rates_old[j] < 99.99))
+    base = [int(math.floor(x)) for x in raw]
+    remainder = new_total - sum(base)
+    order = sorted((raw[i] - base[i], i) for i in range(n_trophies)
+                   if rates_old[i] < 99.99)
+    for _, i in order[-remainder:] if remainder > 0 else []:
+        base[i] += 1
+    # Answers and per-trophy spreads.
+    rows = []
+    for i, trophy in enumerate(case["trophies"]):
+        if rates_old[i] >= 99.99:
+            rows.append({"id": trophy["id"], "q": [100, 100, 100, 100, 100]})
+            continue
+        new_count = counts_old[i] + base[i]
+        median = round2_half_up(new_count / REFRESH_N * 100)
+        # Spread: tight where the two candidate models (progression vs
+        # proportional-to-old-counts) agree, wider where they disagree.
+        # Hb total count = old * (E1 - N1) / (E0 - N0) (proportional scaling).
+        hb_total = counts_old[i] * (REFRESH_E - REFRESH_N) / max(1, (e_old - n_old))
+        hb_rate = round2_half_up(hb_total / REFRESH_N * 100)
+        disagree = abs(logit(median) - logit(hb_rate))
+        spread = min(0.20, 0.02 + 0.15 * disagree)
+        rows.append({"id": trophy["id"], "q": quantiles(median, spread)})
+    return {"trophies": rows}
 
 
-def _neighbour_grid(center, grid):
-    if center is None:
-        return grid
-    near = sorted(grid, key=lambda g: abs(g - center))[:3]
-    return sorted(set(near + [center]))
+# ---------------------------------------------------------------------------
+# Regime 2: FINAL — history with refreshes, long horizon
+# ---------------------------------------------------------------------------
+
+def _linfit(xs, ys):
+    """Least-squares y = a + b*x; returns (a, b, rmse)."""
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
+        return my, 0.0, 0.0
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = sxy / sxx
+    a = my - b * mx
+    rmse = math.sqrt(sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / n)
+    return a, b, rmse
 
 
-def _simulate(earn, players, universal, shape, mult, total_extra, n_refresh):
-    """Simulate n_refresh refreshes to the target. Returns rates in percent.
-    shape is ("pow", alpha): extra earners ~ E^alpha, or ("top", k): extra
-    earners ~ E within the k most-earned trophies only. total_extra is the
-    number of extra non-universal earners the FIRST refresh brings; later
-    refreshes bring 0.85x as many. The total is a parameter, NOT a rate:
-    a refresh that adds many players adds the same documented number of
-    further trophies, so the total must not scale with the multiplier."""
-    earn = list(earn)
-    p = float(players)
-    n = len(earn)
-    decay = 0.85
-    for step in range(n_refresh):
-        m = 1.0 + (mult - 1.0) * (decay ** step)
-        p_new = p * m
-        dp = p_new - p
-        if dp <= 0:
-            break
-        extra_total = total_extra * (decay ** step)
-        kind, param = shape
-        weights = []
-        wsum = 0.0
-        if kind == "top":
-            order = sorted([i for i in range(n) if not universal[i]],
-                           key=lambda i: -earn[i])
-            top = set(order[:int(param)])
-            for i in range(n):
-                w = earn[i] if i in top else 0.0
-                weights.append(w)
-                wsum += w
-        else:
-            alpha = param
-            for i in range(n):
-                if universal[i]:
-                    weights.append(0.0)
-                    continue
-                e = max(earn[i], 0.0)
-                w = (e ** alpha) if alpha > 0 else 1.0
-                # floor so a zero-earner trophy can still gain a little
-                w += 0.05
-                weights.append(w)
-                wsum += w
-        for i in range(n):
-            if universal[i]:
-                earn[i] = p_new  # every new player holds it
-            elif wsum > 0:
-                earn[i] += extra_total * weights[i] / wsum
-            if earn[i] > p_new:
-                earn[i] = p_new
-        p = p_new
-    rates = []
-    for i in range(n):
-        if universal[i]:
-            rates.append(100.0)
-        else:
-            rates.append(earn[i] / p * 100.0 if p > 0 else 0.0)
-    return rates
+def final_forecast(case, states, target_time):
+    """Extrapolate each trophy's logit(rate) in log(days since launch).
+
+    The rate of a trophy is pulled two ways: dilution when N jumps (rate
+    falls) and progression as players advance (rate rises). One smooth trend
+    in log-time captures both to first order. Two guards keep the 4.5-day
+    extrapolation honest:
+    - the trend is fit on the RECENT states only (last 36h), where the
+      progression has already slowed toward saturation; fitting the whole
+      history would extrapolate the steep early rise and overshoot;
+    - the extrapolated logit is SHRUNK toward the last observed rate, more
+      the further the target lies past the last state (weight
+      1 / (1 + ln(tau_target / tau_last))), because a saturating truth
+      always lies below a straight-line extrapolation.
+    The spread comes from the fit residuals, widened by how far the
+    extrapolation sits from persistence, so a trophy whose trend and whose
+    last rate disagree gets wide quantiles.
+    """
+    n_trophies = len(case["trophies"])
+    tau_target = max(0.02, (target_time - LAUNCH).total_seconds() / 86400)
+    log_target = math.log(tau_target)
+    _, _, _, last_rates = states[-1]
+    tau_last = max(0.02, (states[-1][0] - LAUNCH).total_seconds() / 86400)
+    stretch = 1 + 0.5 * max(0.0, math.log(tau_target / tau_last))
+    w_extrap = 1 / (1 + max(0.0, math.log(tau_target / tau_last)))
+    # Recent states: last 36h before the checkpoint (at least 3 states).
+    cutoff = states[-1][0].timestamp() - 36 * 3600
+    recent = [s for s in states if s[0].timestamp() >= cutoff]
+    fit_states = recent if len(recent) >= 3 else states
+    rows = []
+    for i, trophy in enumerate(case["trophies"]):
+        if all(s[3][i] >= 99.99 for s in states):
+            rows.append({"id": trophy["id"], "q": [100, 100, 100, 100, 100]})
+            continue
+        xs, ys = [], []
+        for (t, n, _e, rates) in fit_states:
+            tau = max(0.02, (t - LAUNCH).total_seconds() / 86400)
+            # Continuity-corrected rate from the implied count, so a printed
+            # 0.00% (0 earners) still carries information instead of pinning
+            # the logit at the clamp.
+            cnt = counts_from_rates([rates[i]], n)[0]
+            rate_fit = max(cnt, 0.5) / n * 100
+            xs.append(math.log(tau))
+            ys.append(logit(rate_fit))
+        a, b, rmse = _linfit(xs, ys)
+        # Cap the slope: an extrapolated trend must not run away over 4.5 days.
+        b = max(-3.0, min(3.0, b))
+        extrap = a + b * log_target
+        last_lg = logit(last_rates[i])
+        median_lg = w_extrap * extrap + (1 - w_extrap) * last_lg
+        median = clamp_rate(inv_logit(median_lg))
+        # Floor the spread for trophies that barely moved (their history looks
+        # certain only because nothing has happened yet) and for rare trophies.
+        # Rare NOW (last rate <= 0.05%) means counts of 0-2: their logit is
+        # Poisson-noise dominated, a few earners by the target moves the rate
+        # by an order of magnitude, and the spread must cover that. (Use the
+        # LAST rate, not the max over all states: the launch-night flat state
+        # puts every trophy above 0.6%, which would disable this floor.)
+        floor = 0.80 if last_rates[i] <= 0.05 else 0.10
+        spread = min(1.2, max(floor, rmse * stretch,
+                              0.35 * abs(extrap - last_lg)))
+        rows.append({"id": trophy["id"], "q": quantiles(median, spread)})
+    return {"trophies": rows}
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher + IO
+# ---------------------------------------------------------------------------
+
+def forecast_case(case, name):
+    if case["levels"] != LEVELS:
+        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
+    if not case["history"]:
+        raise ValueError(f"{name} has no history")
+    states = distinct_states(case)
+    target_time = parse_time(case["target"])
+    # Practice: one flat state and a short horizon (no refresh ever seen).
+    if len(states) == 1 and case["horizon_minutes"] <= 180:
+        return practice_forecast(case, states)
+    # Final (or any case with a real refresh history): extrapolate the trend.
+    if len(states) == 1:
+        # One state but a long horizon: no trend to fit, so fall back to the
+        # practice refresh model (it at least expects the refresh).
+        return practice_forecast(case, states)
+    return final_forecast(case, states, target_time)
 
 
 def main():
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    os.makedirs(out_dir, exist_ok=True)
-    names = sorted(f for f in os.listdir(in_dir) if f.endswith(".in"))
-    for name in names:
-        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
-            case = json.load(fh)
-        result = forecast_case(case)
-        stem = name[:-3]
-        with open(os.path.join(out_dir, stem + ".out"), "w", encoding="utf-8") as fh:
-            json.dump(result, fh, separators=(",", ":"))
-            fh.write("\n")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for path in sorted(INPUT_DIR.glob("*.in")):
+        case = json.loads(path.read_text(encoding="utf-8"))
+        forecast = forecast_case(case, path.name)
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(
+            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
