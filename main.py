@@ -1,287 +1,232 @@
 #!/usr/bin/env python3
-"""GTA VI trophy rarity forecaster, v4.
+"""GTA VI trophy rarity forecaster (v5) -- final-target trend model.
 
-Forecasts each trophy's earn rate on Exophase at the case's target as five
-quantiles (5/25/50/75/95%), scored by pinball loss on the logit scale.
+Method (see STUDY-V5.md; spec: FINAL-WAY-ANALYSIS.md section 4):
+  1. Collapse the case history to distinct refresh states.
+  2. Drop the launch-night flat state (the pre-refresh population) and
+     any state before the first refresh: it is a different (reviewer)
+     population and poisons the fit.
+  3. Per trophy, over the LAST 3 distinct states, least-squares fit
+     logit(rate) = a + b*ln(1+t), t = hours since 2026-11-19T00:00Z,
+     with a 0.5-count continuity correction
+     rate_adj = (E + 0.5) / (N + 1) * 100, E = rate * N / 100.
+  4. Shrink the slope: beta = median b over trophies with max rate >= 1%
+     in the used states; b <- 0.5*b + 0.5*beta; re-centre
+     a = mean(logit - b*x).
+  5. Median: the shrunk line read at the case target.
+  6. Spread: s = sqrt((0.5*sqrt(d))^2 + s_res^2) * 0.85, d = horizon in
+     days (target - checkpoint), s_res = residual SD of the shrunk fit
+     (floor 0.15). Quantiles q_tau = inv_logit(logit(med) + z_tau*s),
+     z = (-1.645, -0.674, 0, 0.674, 1.645).
+  7. Low-signal: trophies whose max rate across the used states is
+     < 0.10% get their median floored at 0.10% and spread at 0.8.
+  8. A trophy at 100% stays 100%. Clamp everything to [0.01, 99.99].
 
-Design (see STUDY-V4.md):
-- PRACTICE regime (flat history: Exophase has not refreshed yet, one refresh
-  is coming before the target): the refresh's new earnings are allocated
-  across trophies in proportion to the live (2026-11-20) earner counts raised
-  to a power. Two bracketing allocations are computed, alpha=0.6 (the value
-  that reproduces the stated persistence-baseline loss of 1.51) and
-  alpha=1.0 (the value whose distance from v3's forecast matches v3's actual
-  practice loss of 0.0784). The median is the logit-average of the two
-  answers, and the spread is 0.05 + 0.5 * |logit(a06) - logit(a10)|, i.e. it
-  widens exactly where the two bracketing models disagree. v3 bet everything
-  on alpha=0.6 with a narrow spread; v4 hedges the bracketing pair, which
-  lowers the expected loss across every candidate truth we can construct.
-- FINAL regime (history holds several refresh states): per trophy, fit
-  logit(rate) = a + b * log(days since launch) by least squares over the
-  distinct refresh states and extrapolate to the target; spread from the fit
-  residuals, floored at 0.15 and capped at 1.0.
+Fewer than 3 distinct states after the drop -> persistence + random-walk
+spread (the house baseline): the practice cases land here, by design --
+the practice is a refresh straddle, not a trend, and this program is
+built for the final (Nov 26 target), not for the practice.
 
 Stdlib only, deterministic, no network.
 """
-
 import json
 import math
 import os
-import sys
 from datetime import datetime, timezone
 
-# --- scoring constants (RULES.txt) ---
-TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
-LAUNCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
-
-# --- baked-in facts about the first refresh (house recording, launch night) ---
-# After the flat launch-night page (N0 players, E0 trophies earned), Exophase
-# refreshed once to N1 players and E1 trophies earned. The new earnings on the
-# 54 non-100% trophies are (E1 - N1) - (E0 - N0).
-REFRESH_N1 = 3868
-REFRESH_E1 = 4276
-
-# --- live earner counts at N = 10,000 (Exophase page, read 2026-11-20 10:33 UTC) ---
-# Indexed by trophy id (1..55). Trophy 2 is the 100% trophy (10,000).
-LIVE = {
-    1: 0, 2: 10000, 3: 799, 4: 90, 5: 2, 6: 2, 7: 2, 8: 252, 9: 2, 10: 2,
-    11: 2, 12: 2, 13: 2, 14: 0, 15: 0, 16: 1, 17: 1, 18: 0, 19: 1, 20: 1057,
-    21: 111, 22: 1, 23: 1, 24: 2, 25: 0, 26: 1, 27: 1, 28: 1, 29: 1, 30: 0,
-    31: 0, 32: 0, 33: 19, 34: 2, 35: 102, 36: 7, 37: 18, 38: 17, 39: 3, 40: 1,
-    41: 1, 42: 2, 43: 1, 44: 12, 45: 1, 46: 75, 47: 1, 48: 1, 49: 1, 50: 44,
-    51: 4, 52: 1, 53: 2, 54: 1, 55: 1,
-}
-
-# Bracketing allocation powers and the blend weight between them.
-ALPHA_LO = 0.6
-ALPHA_HI = 1.0
-BLEND_W = 0.5          # 0 -> ALPHA_LO answer, 1 -> ALPHA_HI answer (logit space)
-SPREAD_FLOOR = 0.05    # base logit spread
-SPREAD_SLOPE = 0.5     # per unit of |logit(a_lo) - logit(a_hi)| disagreement
-
-# Final-regime spread bounds.
-FINAL_SPREAD_FLOOR = 0.15
-FINAL_SPREAD_CAP = 1.0
+EPOCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
+Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
 
 
-def logit(x):
-    p = min(99.99, max(0.01, x)) / 100.0
+def parse_ts(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def logit_pct(rate):
+    p = min(max(rate, 0.01), 99.99) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit(l):
-    return 100.0 / (1.0 + math.exp(-l))
+def inv_logit_pct(x):
+    if x >= 0.0:
+        return 100.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return 100.0 * e / (1.0 + e)
 
 
-def round_half_up(x, nd=2):
-    m = 10.0 ** nd
-    return math.floor(x * m + 0.5) / m
+def clamp_pct(v):
+    return min(max(v, 0.01), 99.99)
 
 
-def largest_remainder(weights, total):
-    """Allocate `total` integer units across weights by largest remainder.
-
-    Deterministic: ties keep the original (id) order.
-    """
-    s = sum(weights)
-    if s <= 0 or total <= 0:
-        return [0] * len(weights)
-    raw = [w * total / s for w in weights]
-    base = [int(math.floor(r)) for r in raw]
-    rem = total - sum(base)
-    order = sorted(range(len(raw)), key=lambda i: (raw[i] - base[i]), reverse=True)
-    for k in range(rem):
-        base[order[k]] += 1
-    return base
+def median_of(values):
+    vals = sorted(values)
+    n = len(vals)
+    if n == 0:
+        return 0.0
+    if n % 2 == 1:
+        return vals[n // 2]
+    return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
 
 
-def refresh_answers(old_counts, n0, n1, new_total, alpha):
-    """Answers (rates in %) after one refresh, allocating `new_total` new
-    earnings across the non-100% trophies in proportion to LIVE**alpha."""
-    ids = list(range(len(old_counts)))
-    weights = []
-    for i in ids:
-        tid = i + 1
-        if tid == 2:
-            weights.append(0.0)  # the 100% trophy: handled separately
-        else:
-            live = LIVE.get(tid, 0)
-            weights.append((live ** alpha) if live > 0 else 0.0)
-    new = largest_remainder(weights, new_total)
-    out = []
-    for i, old in enumerate(old_counts):
-        if i + 1 == 2:
-            out.append(100.0)
-        else:
-            out.append(round_half_up((old + new[i]) / n1 * 100.0, 2))
-    return out
-
-
-def refresh_forecast(case):
-    """Practice regime: flat history, one unseen refresh before the target."""
-    trophies = case["trophies"]
-    hist = case["history"]
-    last = hist[-1]
-    n0 = last["players_tracked"]
-    e0 = last["trophies_earned"]
-    rates = last["rates"]
-    old_counts = []
-    for r in rates:
-        if r is None:
-            old_counts.append(0)
-        else:
-            old_counts.append(int(round(r * n0 / 100.0)))
-    new_total = (REFRESH_E1 - REFRESH_N1) - (e0 - n0)
-    new_total = max(0, new_total)
-    a_lo = refresh_answers(old_counts, n0, REFRESH_N1, new_total, ALPHA_LO)
-    a_hi = refresh_answers(old_counts, n0, REFRESH_N1, new_total, ALPHA_HI)
-    rows = []
-    for i, t in enumerate(trophies):
-        tid = t["id"]
-        if tid == 2 or (rates[i] is not None and rates[i] >= 100.0):
-            rows.append({"id": tid, "q": [100.0, 100.0, 100.0, 100.0, 100.0]})
-            continue
-        lo = a_lo[i]
-        hi = a_hi[i]
-        med = inv_logit((1.0 - BLEND_W) * logit(lo) + BLEND_W * logit(hi))
-        spread = SPREAD_FLOOR + SPREAD_SLOPE * abs(logit(lo) - logit(hi))
-        qs = []
-        for z in Z:
-            q = inv_logit(logit(med) + z * spread)
-            qs.append(round(min(100.0, max(0.0, q)), 4))
-        # enforce non-decreasing after rounding
-        for k in range(1, 5):
-            if qs[k] < qs[k - 1]:
-                qs[k] = qs[k - 1]
-        rows.append({"id": tid, "q": qs})
-    return rows
-
-
-def parse_time(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
-def trend_forecast(case):
-    """Final regime: several refresh states in the history; fit each trophy's
-    logit rate against log(days since launch) and extrapolate to the target."""
-    trophies = case["trophies"]
-    hist = case["history"]
-    target = parse_time(case["target"])
-    days_target = max(0.05, (target - LAUNCH).total_seconds() / 86400.0)
-    x_target = math.log(days_target)
-
-    # Collapse the history to distinct refresh states (a state = one rates vector).
+def distinct_states(history):
+    """Collapse consecutive identical reads to distinct refresh states."""
     states = []
-    seen = set()
-    for read in hist:
-        key = (read["players_tracked"], tuple(read["rates"]))
-        if key in seen:
-            continue
-        seen.add(key)
-        states.append(read)
-    if len(states) < 2:
-        return refresh_forecast(case)
+    prev_key = None
+    for read in history:
+        key = (read.get("players_tracked"), read.get("trophies_earned"),
+               tuple(read.get("rates") or []))
+        if key != prev_key:
+            states.append(read)
+            prev_key = key
+    return states
 
-    xs = []
-    for read in states:
-        at = parse_time(read["at"])
-        days = max(0.05, (at - LAUNCH).total_seconds() / 86400.0)
-        xs.append(math.log(days))
-    x_mean = sum(xs) / len(xs)
-    sxx = sum((x - x_mean) ** 2 for x in xs)
 
-    rows = []
-    for i, t in enumerate(trophies):
-        tid = t["id"]
-        last_rate = hist[-1]["rates"][i]
-        if tid == 2 or (last_rate is not None and last_rate >= 100.0):
-            rows.append({"id": tid, "q": [100.0, 100.0, 100.0, 100.0, 100.0]})
-            continue
-        ys = []
-        ok = True
-        for read in states:
-            r = read["rates"][i]
-            n = read["players_tracked"]
-            if r is None:
-                ok = False
-                break
-            # continuity correction: 0% -> half a count, 100% -> N - half a count
-            if r <= 0.0:
-                r = 0.5 / n * 100.0
-            elif r >= 100.0:
-                r = (n - 0.5) / n * 100.0
-            ys.append(logit(r))
-        if not ok or len(ys) < 2 or sxx <= 0:
-            # degenerate: fall back to persistence with a wide spread
-            base = last_rate if last_rate is not None else 0.1
-            spread = 0.5
-            qs = [round(min(100.0, max(0.0, inv_logit(logit(base) + z * spread))), 4)
-                  for z in Z]
-            rows.append({"id": tid, "q": qs})
-            continue
-        y_mean = sum(ys) / len(ys)
-        sxy = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
-        b = sxy / sxx
-        a = y_mean - b * x_mean
-        resid = [y - (a + b * x) for x, y in zip(xs, ys)]
-        dof = max(1, len(ys) - 2)
-        resid_sd = math.sqrt(sum(r * r for r in resid) / dof)
-        leverage = 1.0 / len(ys) + (x_target - x_mean) ** 2 / sxx
-        spread = resid_sd * math.sqrt(1.0 + leverage)
-        spread = min(FINAL_SPREAD_CAP, max(FINAL_SPREAD_FLOOR, spread))
-        med = inv_logit(a + b * x_target)
-        # Low-signal trophies: the history shows essentially no earners (the
-        # rates sit at the 2-decimal / half-count floor), so the log-days fit
-        # is fitting the clipping floor, not a trend, and it extrapolates a
-        # near-zero rate. Over a week such trophies do get earned, so floor
-        # the median and widen the spread to cover that honestly.
-        max_rate = max(
-            (read["rates"][i] or 0.0) for read in states
-        )
-        if max_rate < 0.10:
-            med = max(med, 0.10)
-            spread = max(spread, 0.8)
-        qs = []
-        for z in Z:
-            q = inv_logit(logit(med) + z * spread)
-            qs.append(round(min(100.0, max(0.0, q)), 4))
-        for k in range(1, 5):
-            if qs[k] < qs[k - 1]:
-                qs[k] = qs[k - 1]
-        rows.append({"id": tid, "q": qs})
-    return rows
+def fit_line(xs, ys):
+    """Least squares y = a + b*x. Returns (a, b)."""
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    den = sum((x - mx) ** 2 for x in xs)
+    if den <= 0.0:
+        return my, 0.0
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = num / den
+    return my - b * mx, b
+
+
+def quantiles_from(med, spread):
+    """Five quantiles around a median at a logit spread, clamped, ordered."""
+    base = logit_pct(med)
+    qs = [round(clamp_pct(inv_logit_pct(base + z * spread)), 4) for z in Z]
+    for i in range(1, len(qs)):
+        if qs[i] < qs[i - 1]:
+            qs[i] = qs[i - 1]
+    return qs
+
+
+def persistence_row(last_rate, horizon_days):
+    """House baseline: median = last rate, random-walk spread."""
+    if last_rate >= 100.0:
+        return [100.0, 100.0, 100.0, 100.0, 100.0]
+    spread = 0.5 * math.sqrt(max(horizon_days, 0.0))
+    return quantiles_from(last_rate, spread)
 
 
 def forecast_case(case):
-    """Pick the regime from the history's shape: one distinct state means the
-    page has never refreshed yet (practice); several states mean real trend
-    data (final)."""
-    hist = case["history"]
-    states = set()
-    for read in hist:
-        states.add((read["players_tracked"], tuple(read["rates"])))
-    if len(states) <= 1:
-        return refresh_forecast(case)
-    return trend_forecast(case)
+    trophies = case["trophies"]
+    history = case.get("history") or []
+    at = parse_ts(case["at"])
+    target = parse_ts(case["target"])
+    horizon_days = (target - at).total_seconds() / 86400.0
+    t_target = max((target - EPOCH).total_seconds() / 3600.0, 0.0)
+    x_target = math.log1p(t_target)
+
+    # Last rate per trophy, from the last history read.
+    last_rates = {}
+    if history:
+        last_read = history[-1]
+        last_list = last_read.get("rates") or []
+        for i, tr in enumerate(trophies):
+            rate = last_list[i] if i < len(last_list) else None
+            last_rates[tr["id"]] = rate if rate is not None else 0.01
+
+    states = distinct_states(history)
+    # Drop the pre-refresh state(s): the first distinct state, when a
+    # later state differs from it, is the launch-night flat population.
+    # With a single distinct state there was no refresh at all, so it is
+    # the flat state too and nothing remains to fit on.
+    if len(states) >= 2:
+        states = states[1:]
+    else:
+        states = []
+
+    rows = []
+    if len(states) < 3:
+        # Not enough distinct post-refresh states to fit a trend:
+        # persistence + random-walk spread (house baseline).
+        for tr in trophies:
+            rows.append({"id": tr["id"],
+                         "q": persistence_row(last_rates.get(tr["id"], 0.01),
+                                              horizon_days)})
+        return {"trophies": rows}
+
+    used = states[-3:]
+
+    # Per-trophy fit points over the used states.
+    series = {}
+    for idx, tr in enumerate(trophies):
+        pts = []
+        for st in used:
+            rates = st.get("rates") or []
+            rate = rates[idx] if idx < len(rates) else None
+            if rate is None:
+                continue
+            n_players = st.get("players_tracked") or 0
+            if n_players <= 0:
+                continue
+            earners = rate * n_players / 100.0
+            rate_adj = (earners + 0.5) / (n_players + 1.0) * 100.0
+            t_hours = max((parse_ts(st["at"]) - EPOCH).total_seconds()
+                          / 3600.0, 0.0)
+            pts.append((math.log1p(t_hours), logit_pct(rate_adj), rate))
+        series[tr["id"]] = pts
+
+    # Raw least-squares slopes, then the shared slope beta.
+    slopes = {}
+    for tid, pts in series.items():
+        if len(pts) >= 2:
+            _, b = fit_line([p[0] for p in pts], [p[1] for p in pts])
+            slopes[tid] = b
+    strong = [slopes[tid] for tid, pts in series.items()
+              if tid in slopes and max(p[2] for p in pts) >= 1.0]
+    if strong:
+        beta = median_of(strong)
+    elif slopes:
+        beta = median_of(list(slopes.values()))
+    else:
+        beta = 0.0
+
+    rw = 0.5 * math.sqrt(max(horizon_days, 0.0))
+    for tr in trophies:
+        tid = tr["id"]
+        last = last_rates.get(tid, 0.01)
+        if last >= 100.0:
+            rows.append({"id": tid, "q": [100.0, 100.0, 100.0, 100.0, 100.0]})
+            continue
+        pts = series.get(tid, [])
+        if len(pts) < 2 or tid not in slopes:
+            rows.append({"id": tid,
+                         "q": persistence_row(last, horizon_days)})
+            continue
+        # Shrink the slope halfway toward the shared slope, re-centre.
+        b_shrunk = 0.5 * slopes[tid] + 0.5 * beta
+        a_shrunk = sum(p[1] - b_shrunk * p[0] for p in pts) / len(pts)
+        resid = [p[1] - (a_shrunk + b_shrunk * p[0]) for p in pts]
+        s_res = max(math.sqrt(sum(r * r for r in resid) / len(resid)), 0.15)
+        med = clamp_pct(inv_logit_pct(a_shrunk + b_shrunk * x_target))
+        spread = math.sqrt(rw * rw + s_res * s_res) * 0.85
+        # Low-signal: the fit is fitting the rounding floor, not a trend.
+        if max(p[2] for p in pts) < 0.10:
+            med = max(med, 0.10)
+            spread = max(spread, 0.8)
+        rows.append({"id": tid, "q": quantiles_from(med, spread)})
+    return {"trophies": rows}
 
 
 def main():
     in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    names = sorted(f for f in os.listdir(in_dir) if f.endswith(".in"))
-    for name in names:
-        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
-            case = json.load(fh)
-        rows = forecast_case(case)
-        out = {"trophies": rows}
+    for name in sorted(os.listdir(in_dir)):
+        if not name.endswith(".in"):
+            continue
+        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as f:
+            case = json.load(f)
+        forecast = forecast_case(case)
         out_name = name[:-3] + ".out"
-        with open(os.path.join(out_dir, out_name), "w", encoding="utf-8") as fh:
-            json.dump(out, fh, separators=(",", ":"))
-            fh.write("\n")
-    return 0
+        with open(os.path.join(out_dir, out_name), "w", encoding="utf-8") as f:
+            f.write(json.dumps(forecast))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
